@@ -44,6 +44,9 @@ import (
 // Version wrapper type of the WAF version.
 type Version C.ddwaf_version
 
+//RulesetInfo wrapper type of the WAF version
+type RulesetInfo C.ddwaf_ruleset_info
+
 // String returns the string representation of the version in the form
 // <major>.<minor>.<patch>.
 func (v *Version) String() string {
@@ -73,6 +76,8 @@ type Handle struct {
 	encoder encoder
 	// addresses the WAF rule is expecting.
 	addresses []string
+	// TODO
+	rulesetInfo *C.ddwaf_ruleset_info
 }
 
 // NewHandle creates a new instance of the WAF with the given JSON rule.
@@ -104,11 +109,14 @@ func NewHandle(jsonRule []byte) (*Handle, error) {
 		maxArrayLength:  C.DDWAF_MAX_ARRAY_LENGTH,
 		maxMapLength:    C.DDWAF_MAX_ARRAY_LENGTH,
 	}
+
+	var rInfo C.ddwaf_ruleset_info
 	handle := C.ddwaf_init(wafRule.ctype(), &C.ddwaf_config{
 		maxArrayLength: C.uint64_t(encoder.maxArrayLength),
 		maxMapDepth:    C.uint64_t(encoder.maxMapLength),
-	})
+	}, &rInfo)
 	if handle == nil {
+		C.ddwaf_ruleset_info_free(&rInfo)
 		return nil, errors.New("could not instantiate the waf rule")
 	}
 	incNbLiveCObjects()
@@ -117,14 +125,16 @@ func NewHandle(jsonRule []byte) (*Handle, error) {
 	addresses, err := ruleAddresses(handle)
 	if err != nil {
 		C.ddwaf_destroy(handle)
+		C.ddwaf_ruleset_info_free(&rInfo)
 		decNbLiveCObjects()
 		return nil, err
 	}
 
 	return &Handle{
-		handle:    handle,
-		encoder:   encoder,
-		addresses: addresses,
+		handle:      handle,
+		encoder:     encoder,
+		addresses:   addresses,
+		rulesetInfo: &rInfo,
 	}, nil
 }
 
@@ -156,6 +166,7 @@ func (waf *Handle) Close() {
 	// Context using the WAF handle.
 	waf.mu.Lock()
 	defer waf.mu.Unlock()
+	C.ddwaf_ruleset_info_free(waf.rulesetInfo)
 	C.ddwaf_destroy(waf.handle)
 	decNbLiveCObjects()
 	waf.handle = nil
