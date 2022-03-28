@@ -44,9 +44,6 @@ import (
 // Version wrapper type of the WAF version.
 type Version C.ddwaf_version
 
-//RulesetInfo wrapper type of the WAF version
-type RulesetInfo C.ddwaf_ruleset_info
-
 // String returns the string representation of the version in the form
 // <major>.<minor>.<patch>.
 func (v *Version) String() string {
@@ -77,7 +74,20 @@ type Handle struct {
 	// addresses the WAF rule is expecting.
 	addresses []string
 	// TODO
-	rulesetInfo *C.ddwaf_ruleset_info
+	rulesetInfo RulesetInfo
+}
+
+// RulesetInfo stores the information - provided by the WAF - about WAF rules initialization
+type RulesetInfo struct {
+	// Number of rules successfully loaded
+	Loaded uint16
+	// Number of rules which failed to parse
+	Failed uint16
+	// Map from an error string to an array of all the rule ids for which
+	// that error was raised. {error: [rule_ids]}
+	Errors map[string]interface{}
+	// Ruleset version
+	Version string
 }
 
 // NewHandle creates a new instance of the WAF with the given JSON rule.
@@ -110,22 +120,34 @@ func NewHandle(jsonRule []byte) (*Handle, error) {
 		maxMapLength:    C.DDWAF_MAX_ARRAY_LENGTH,
 	}
 
-	var rInfo C.ddwaf_ruleset_info
+	var wafRInfo C.ddwaf_ruleset_info
+	defer C.ddwaf_ruleset_info_free(&wafRInfo)
 	handle := C.ddwaf_init(wafRule.ctype(), &C.ddwaf_config{
 		maxArrayLength: C.uint64_t(encoder.maxArrayLength),
 		maxMapDepth:    C.uint64_t(encoder.maxMapLength),
-	}, &rInfo)
+	}, &wafRInfo)
 	if handle == nil {
-		C.ddwaf_ruleset_info_free(&rInfo)
 		return nil, errors.New("could not instantiate the waf rule")
 	}
 	incNbLiveCObjects()
 
+	// Decode the ruleset information returned by the WAF
+	rInfo := RulesetInfo{
+		Failed:  uint16(wafRInfo.failed),
+		Loaded:  uint16(wafRInfo.loaded),
+		Version: C.GoString(wafRInfo.version),
+	}
+	errors, err := decodeMap((*wafObject)(&wafRInfo.errors))
+	if err != nil {
+		C.ddwaf_destroy(handle)
+		decNbLiveCObjects()
+		return nil, err
+	}
+	rInfo.Errors = errors
 	// Get the addresses the rule listens to
 	addresses, err := ruleAddresses(handle)
 	if err != nil {
 		C.ddwaf_destroy(handle)
-		C.ddwaf_ruleset_info_free(&rInfo)
 		decNbLiveCObjects()
 		return nil, err
 	}
@@ -134,7 +156,7 @@ func NewHandle(jsonRule []byte) (*Handle, error) {
 		handle:      handle,
 		encoder:     encoder,
 		addresses:   addresses,
-		rulesetInfo: &rInfo,
+		rulesetInfo: rInfo,
 	}, nil
 }
 
@@ -159,6 +181,10 @@ func (waf *Handle) Addresses() []string {
 	return waf.addresses
 }
 
+func (waf *Handle) RulesetInfo() interface{} {
+	return waf.rulesetInfo
+}
+
 // Close the WAF and release the underlying C memory as soon as there are
 // no more WAF contexts using the rule.
 func (waf *Handle) Close() {
@@ -166,7 +192,6 @@ func (waf *Handle) Close() {
 	// Context using the WAF handle.
 	waf.mu.Lock()
 	defer waf.mu.Unlock()
-	C.ddwaf_ruleset_info_free(waf.rulesetInfo)
 	C.ddwaf_destroy(waf.handle)
 	decNbLiveCObjects()
 	waf.handle = nil
@@ -527,6 +552,58 @@ func (e *encoder) encodeUint64(n uint64, wo *wafObject) error {
 	return e.encodeString(strconv.FormatUint(n, 10), wo)
 }
 
+func decodeObject(wo *wafObject) (v interface{}, err error) {
+	switch wo._type {
+	case wafUintType:
+		return uint64(*wo.uint64ValuePtr()), nil
+	case wafIntType:
+		return int64(*wo.int64ValuePtr()), nil
+	case wafStringType:
+		return C.GoString(*wo.stringValuePtr()), nil
+	case wafArrayType:
+		return decodeArray(wo)
+	case wafMapType: // could be a map or a struct, no way to differentiate
+		return decodeMap(wo)
+	default:
+		return nil, ErrInvalidArgument
+	}
+}
+
+func decodeArray(wo *wafObject) ([]interface{}, error) {
+	var err error
+	len := wo.length()
+	arr := make([]interface{}, len)
+	for i := C.ulong(0); i < len && err == nil; i++ {
+		arr[i], err = decodeObject(wo.index(i))
+	}
+	return arr, err
+}
+
+func decodeMap(wo *wafObject) (map[string]interface{}, error) {
+	length := wo.length()
+	decodedMap := make(map[string]interface{}, length)
+	for i := C.uint64_t(0); i < length; i++ {
+		obj := wo.index(i)
+		if key, err := decodeMapKey(obj); err == nil {
+			if val, err := decodeObject(obj); err == nil {
+				decodedMap[key] = val
+			} else {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+	return decodedMap, nil
+}
+func decodeMapKey(wo *wafObject) (string, error) {
+	keyLen := uint64(wo.parameterNameLength)
+	if wo._type != wafStringType || keyLen == 0 {
+		return "", ErrInvalidArgument
+	}
+	return C.GoString(wo.mapKey()), nil
+}
+
 const (
 	wafUintType    = C.DDWAF_OBJ_UNSIGNED
 	wafIntType     = C.DDWAF_OBJ_SIGNED
@@ -621,6 +698,15 @@ func (v *wafObject) index(i C.uint64_t) *wafObject {
 	// Go pointer arithmetic equivalent to the C expression `a->value.array[i]`
 	base := uintptr(unsafe.Pointer(*v.arrayValuePtr()))
 	return (*wafObject)(unsafe.Pointer(base + C.sizeof_ddwaf_object*uintptr(i)))
+}
+
+// Helper functions for testing, where direct cgo import is not allowed
+
+func toCInt64(v int) C.int64_t {
+	return C.int64_t(v)
+}
+func toCUint64(v uint) C.uint64_t {
+	return C.uint64_t(v)
 }
 
 // nbLiveCObjects is a simple monitoring of the number of C allocations.
