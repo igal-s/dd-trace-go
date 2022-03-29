@@ -7,9 +7,7 @@
 package gorm
 
 import (
-	"context"
 	"math"
-	"time"
 
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
@@ -17,12 +15,6 @@ import (
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/log"
 
 	"gorm.io/gorm"
-)
-
-type key string
-
-const (
-	gormSpanStartTimeKey = key("dd-trace-go:span")
 )
 
 // Open opens a new (traced) database connection. The used driver must be formerly registered
@@ -95,7 +87,13 @@ func withCallbacks(db *gorm.DB, opts ...Option) (*gorm.DB, error) {
 
 func before(scope *gorm.DB) {
 	if scope.Statement != nil && scope.Statement.Context != nil {
-		scope.Statement.Context = context.WithValue(scope.Statement.Context, gormSpanStartTimeKey, time.Now())
+		ctx := scope.Statement.Context
+		s, ok := tracer.SpanFromContext(ctx)
+		if !ok {
+			return
+		}
+		metaS := newMetaSpan(s.Context()) // TODO check if we need to take special care of nested gorm calls (i.e. gormq-->gormq-->sqlq), use reflection? store span list?
+		scope.Statement.Context = tracer.ContextWithSpan(ctx, metaS)
 	}
 }
 
@@ -105,13 +103,19 @@ func after(db *gorm.DB, operationName string, cfg *config) {
 	}
 
 	ctx := db.Statement.Context
-	t, ok := ctx.Value(gormSpanStartTimeKey).(time.Time)
+	s, ok := tracer.SpanFromContext(ctx)
+	if !ok {
+		return
+	}
+	metaS, ok := s.(metaSpan)
 	if !ok {
 		return
 	}
 
 	opts := []ddtrace.StartSpanOption{
-		tracer.StartTime(t),
+		tracer.WithSpanID(metaS.GetSpanID()),
+		tracer.ChildOf(metaS.GetParentCtx()),
+		tracer.StartTime(metaS.GetStartTime()),
 		tracer.ServiceName(cfg.serviceName),
 		tracer.SpanType(ext.SpanTypeSQL),
 		tracer.ResourceName(db.Statement.SQL.String()),
@@ -120,7 +124,7 @@ func after(db *gorm.DB, operationName string, cfg *config) {
 		opts = append(opts, tracer.Tag(ext.EventSampleRate, cfg.analyticsRate))
 	}
 
-	span, _ := tracer.StartSpanFromContext(ctx, operationName, opts...)
+	span := tracer.StartSpan(operationName, opts...)
 	var dbErr error
 	if cfg.errCheck(db.Error) {
 		dbErr = db.Error
