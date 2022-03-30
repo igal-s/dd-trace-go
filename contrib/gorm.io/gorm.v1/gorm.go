@@ -93,7 +93,7 @@ func before(scope *gorm.DB) {
 			return
 		}
 		metaS := newMetaSpan(s.Context()) // TODO check if we need to take special care of nested gorm calls (i.e. gormq-->gormq-->sqlq), use reflection? store span list?
-		scope.Statement.Context = tracer.ContextWithSpan(ctx, metaS)
+		scope.WithContext(tracer.ContextWithSpan(ctx, metaS))
 	}
 }
 
